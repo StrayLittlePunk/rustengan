@@ -1,14 +1,17 @@
-use std::io::{StdoutLock, Write};
+use std::io::StdoutLock;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-fn main() -> anyhow::Result<()> {
+pub fn main_loop<S, Payload>(mut state: S) -> anyhow::Result<()>
+where
+    S: Node<Payload>,
+    Payload: DeserializeOwned,
+{
     let stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message>();
-    let mut state = EchoNode { id: 0 };
-
+    let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message<Payload>>();
     for input in inputs {
         let input = input.context("Maelstrom input from STDIN could not be deserialized")?;
         state
@@ -19,80 +22,44 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct EchoNode {
-    id: usize,
-}
-impl EchoNode {
-    pub fn step(&mut self, input: Message, output: &mut StdoutLock) -> anyhow::Result<()> {
-        match input.body.payload {
-            Payload::Init { .. } => {
-                let reply = Message {
-                    src: input.dst,
-                    dst: input.src,
-                    body: Body {
-                        id: Some(self.id),
-                        in_reply_to: input.body.id,
-                        payload: Payload::InitOk,
-                    },
-                };
-                serde_json::to_writer(&mut *output, &reply)
-                    .context("serialize response to init")?;
-                output.write_all(b"\n").context("write \\n failed")?;
-                self.id += 1;
-            }
-            Payload::InitOk => bail!("we should never receive init_ok"),
-            Payload::Echo { echo } => {
-                let reply = Message {
-                    src: input.dst,
-                    dst: input.src,
-                    body: Body {
-                        id: Some(self.id),
-                        in_reply_to: input.body.id,
-                        payload: Payload::EchoOk { echo },
-                    },
-                };
-                serde_json::to_writer(&mut *output, &reply).context("serialze repsonse to echo")?;
-                output.write_all(b"\n").context("write \\n failed")?;
-                self.id += 1;
-            }
-
-            Payload::EchoOk { .. } => {}
-        }
-
-        Ok(())
-    }
+pub trait Node<Payload> {
+    fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Message {
-    src: String,
+pub struct Message<Payload> {
+    pub src: String,
     #[serde(rename = "dest")]
-    dst: String,
-    body: Body,
+    pub dst: String,
+    pub body: Body<Payload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Body {
+pub struct Body<Payload> {
     #[serde(rename = "msg_id")]
-    id: Option<usize>,
-    in_reply_to: Option<usize>,
+    pub id: Option<usize>,
+    pub in_reply_to: Option<usize>,
     #[serde(flatten)]
-    payload: Payload,
+    pub payload: Payload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-enum Payload {
-    Echo {
-        echo: String,
-    },
-    EchoOk {
-        echo: String,
-    },
-    Init {
-        node_id: String,
-        node_ids: Vec<String>,
-    },
-    InitOk,
+pub struct Echo {
+    pub echo: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EchoOk {
+    pub echo: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Init {
+    pub node_id: String,
+    pub node_ids: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct InitOk;
