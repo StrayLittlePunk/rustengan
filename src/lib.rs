@@ -1,28 +1,58 @@
-use std::io::StdoutLock;
+use std::io::{BufRead, StdoutLock, Write};
 
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub fn main_loop<S, Payload>(mut state: S) -> anyhow::Result<()>
+pub fn main_loop<S, N, P>(init_state: S) -> anyhow::Result<()>
 where
-    S: Node<Payload>,
-    Payload: DeserializeOwned,
+    P: DeserializeOwned + Serialize,
+    N: Node<S, P>,
 {
     let stdin = std::io::stdin().lock();
+    let mut stdin = stdin.lines();
     let mut stdout = std::io::stdout().lock();
-    let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message<Payload>>();
-    for input in inputs {
-        let input = input.context("Maelstrom input from STDIN could not be deserialized")?;
-        state
-            .step(input, &mut stdout)
+
+    let init_msg: Message<InitPayload> = serde_json::from_str(
+        stdin
+            .next()
+            .expect("no init message received")
+            .context("failed to read from stdin")?
+            .as_str(),
+    )
+    .context("init message could not be deserialized")?;
+    let InitPayload::Init(init) = init_msg.body.payload else {
+        panic!("first message should be init");
+    };
+    let reply = Message {
+        src: init_msg.dst,
+        dst: init_msg.src,
+        body: Body {
+            id: Some(0),
+            in_reply_to: init_msg.body.id,
+            payload: InitPayload::InitOk,
+        },
+    };
+    serde_json::to_writer(&mut stdout, &reply).context("serialize response to init")?;
+    stdout.write_all(b"\n").context("write \\n failed")?;
+
+    let mut node = N::from_init(init_state, init).expect("should construct a node");
+    for input in stdin {
+        let input: Message<P> = serde_json::from_str(
+            &input.context("Maelstrom input from STDIN could not be deserialized")?,
+        )?;
+        node.step(input, &mut stdout)
             .context("Node step function failed")?;
     }
 
     Ok(())
 }
 
-pub trait Node<Payload> {
+pub trait Node<S, Payload> {
+    fn from_init(init_state: S, init: Init) -> anyhow::Result<Self>
+    where
+        Self: Sized;
+
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()>;
 }
 
@@ -42,24 +72,16 @@ pub struct Body<Payload> {
     #[serde(flatten)]
     pub payload: Payload,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct Echo {
-    pub echo: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct EchoOk {
-    pub echo: String,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub struct Init {
     pub node_id: String,
     pub node_ids: Vec<String>,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-pub struct InitOk;
+enum InitPayload {
+    Init(Init),
+    InitOk,
+}
