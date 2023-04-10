@@ -1,4 +1,4 @@
-use std::io::{StdoutLock, Write};
+use std::io::StdoutLock;
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use rustengan::*;
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<_, UniqueNode, _>(())?;
+    main_loop::<_, UniqueNode, _, _>(())?;
     Ok(())
 }
 
@@ -15,7 +15,11 @@ struct UniqueNode {
     node_id: String,
 }
 impl Node<(), Payload> for UniqueNode {
-    fn from_init(_: (), init: Init) -> anyhow::Result<Self>
+    fn from_init(
+        _: (),
+        init: Init,
+        _: std::sync::mpsc::Sender<Event<Payload>>,
+    ) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -24,15 +28,18 @@ impl Node<(), Payload> for UniqueNode {
             node_id: init.node_id,
         })
     }
-    fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+        let Event::Message(input) = input else {
+            panic!("got injected event when there's no event injection");
+        };
         let mut reply = input.into_reply(Some(&mut self.id));
         match reply.body.payload {
             Payload::Generate => {
                 let guid = format!("{}-{}", self.node_id, self.id);
                 reply.body.payload = Payload::GenerateOk { guid };
-                serde_json::to_writer(&mut *output, &reply)
+                reply
+                    .send(output)
                     .context("serialze repsonse to generate")?;
-                output.write_all(b"\n").context("write \\n failed")?;
             }
             Payload::GenerateOk { .. } => bail!("we should never receive generate_ok"),
         }

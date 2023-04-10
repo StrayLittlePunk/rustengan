@@ -1,4 +1,4 @@
-use std::io::{StdoutLock, Write};
+use std::io::StdoutLock;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use rustengan::*;
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<_, EchoNode, _>(())?;
+    main_loop::<_, EchoNode, _, _>(())?;
     Ok(())
 }
 
@@ -14,19 +14,21 @@ struct EchoNode {
     id: usize,
 }
 impl Node<(), Payload> for EchoNode {
-    fn from_init(_: (), _: Init) -> anyhow::Result<Self>
+    fn from_init(_: (), _: Init, _: std::sync::mpsc::Sender<Event<Payload>>) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
         Ok(EchoNode { id: 1 })
     }
-    fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+        let Event::Message(input) = input else {
+            panic!("got injected event when there's no event injection");
+        };
         let mut reply = input.into_reply(Some(&mut self.id));
         match reply.body.payload {
             Payload::Echo { echo } => {
                 reply.body.payload = Payload::EchoOk { echo };
-                serde_json::to_writer(&mut *output, &reply).context("serialze repsonse to echo")?;
-                output.write_all(b"\n").context("write \\n failed")?;
+                reply.send(output).context("serialze repsonse to echo")?;
             }
             Payload::EchoOk { .. } => {}
         }
