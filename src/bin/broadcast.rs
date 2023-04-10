@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::StdoutLock;
 
 use anyhow::Context;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use rustengan::*;
@@ -80,6 +81,10 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                             .context("serialze repsonse to topology")?;
                     }
                     Payload::Gossip { seen } => {
+                        self.known
+                            .get_mut(&reply.dst)
+                            .expect("got gossip from unknown node")
+                            .extend(seen.iter().copied());
                         self.messages.extend(seen);
                     }
                     Payload::GossipOk
@@ -91,20 +96,30 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
             Event::Injected(InjectedPayload::Gossip) => {
                 for n in &self.neighborhood {
                     let knows_to_n = &self.known[n];
+                    let (already_known, mut notify_of): (HashSet<_>, HashSet<_>) = self
+                        .messages
+                        .iter()
+                        .copied()
+                        .partition(|m| knows_to_n.contains(m));
+                    // eprintln!("notify of {}/{}", notify_of.len(), self.messages.len());
+                    // if we know that n knows m, we don't tell n that we know m
+                    // send us m for all eternity, so
+                    // include a couple of extra messages to let them know that we know they know
+                    let mut rng = rand::thread_rng();
+                    notify_of.extend(already_known.iter().filter(|_| {
+                        rng.gen_ratio(
+                            10.min(already_known.len()) as u32,
+                            already_known.len() as u32,
+                        )
+                    }));
+
                     Message {
                         src: self.node_id.clone(),
                         dst: n.clone(),
                         body: Body {
                             id: None,
                             in_reply_to: None,
-                            payload: Payload::Gossip {
-                                seen: self
-                                    .messages
-                                    .iter()
-                                    .filter(|&m| !knows_to_n.contains(m))
-                                    .copied()
-                                    .collect(),
-                            },
+                            payload: Payload::Gossip { seen: notify_of },
                         },
                     }
                     .send(&mut *output)
