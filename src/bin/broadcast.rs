@@ -45,7 +45,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                 .into_iter()
                 .map(|nid| (nid, HashSet::new()))
                 .collect(),
-            neighborhood: Vec::new(),
+            neighborhood: Default::default(),
             //     msg_communicated: HashMap::new(),
         })
     }
@@ -72,10 +72,27 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         reply.send(output).context("serialze repsonse to read")?;
                     }
                     Payload::Topology { mut topology } => {
+                        let topology_length = topology.len();
+                        // 找到不是邻居的邻居，随机抽取 ratio(17.min(not_neighbor.len()), not_neighbor.len()) 作为新的邻居，如果邻居太多就会传播泛洪,所以要小于节点数的一半
                         reply.body.payload = Payload::TopologyOk;
                         self.neighborhood = topology.remove(&self.node_id).unwrap_or_else(|| {
                             panic!("no topology given for node {}", self.node_id)
                         });
+                        // eprintln!("before neighborhood: {:?}", self.neighborhood);
+                        self.neighborhood.iter().for_each(|c| {
+                            let _ = topology.remove(c);
+                        });
+                        let mut rng = rand::thread_rng();
+                        let remain_topology_length = topology.len();
+                        self.neighborhood.extend(topology.into_keys().filter(|_| {
+                            rng.gen_ratio(
+                                14.min(remain_topology_length) as u32,
+                                remain_topology_length as u32,
+                            )
+                        }));
+                        self.neighborhood.shrink_to(topology_length / 2);
+
+                        //eprintln!("neighborhood: {:?}", self.neighborhood);
                         reply
                             .send(output)
                             .context("serialze repsonse to topology")?;
@@ -108,7 +125,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     let mut rng = rand::thread_rng();
                     notify_of.extend(already_known.iter().filter(|_| {
                         rng.gen_ratio(
-                            10.min(already_known.len()) as u32,
+                            30.min(already_known.len()) as u32,
                             already_known.len() as u32,
                         )
                     }));
