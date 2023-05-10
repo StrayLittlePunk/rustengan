@@ -1,10 +1,13 @@
 use std::io::{BufRead, StdoutLock, Write};
+use std::sync::mpsc::Receiver;
 
-use anyhow::Context;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-pub fn main_loop<S, N, P, I>(init_state: S) -> anyhow::Result<()>
+pub type Result<T> = std::result::Result<T, GanError>;
+
+pub fn main_loop<S, N, P, I>(init_state: S) -> Result<()>
 where
     P: DeserializeOwned + Serialize + Send + 'static,
     N: Node<S, P, I>,
@@ -15,14 +18,8 @@ where
     let mut stdin = stdin.lines();
     let mut stdout = std::io::stdout().lock();
 
-    let init_msg: Message<InitPayload> = serde_json::from_str(
-        stdin
-            .next()
-            .expect("no init message received")
-            .context("failed to read from stdin")?
-            .as_str(),
-    )
-    .context("init message could not be deserialized")?;
+    let init_msg: Message<InitPayload> =
+        serde_json::from_str(&stdin.next().expect("no init message received")?)?;
     let InitPayload::Init(init) = init_msg.body.payload else {
         panic!("first message should be init");
     };
@@ -35,8 +32,8 @@ where
             payload: InitPayload::InitOk,
         },
     };
-    serde_json::to_writer(&mut stdout, &reply).context("serialize response to init")?;
-    stdout.write_all(b"\n").context("write \\n failed")?;
+    serde_json::to_writer(&mut stdout, &reply)?;
+    stdout.write_all(b"\n")?;
 
     let (tx, rx) = std::sync::mpsc::channel();
     let stdin_tx = tx.clone();
@@ -45,26 +42,21 @@ where
     let handle = std::thread::spawn(move || {
         let stdin = std::io::stdin().lock();
         for input in stdin.lines() {
-            let input: Message<P> = serde_json::from_str(
-                &input.context("Maelstrom input from STDIN could not be deserialized")?,
-            )?;
-
+            let input: Message<P> = serde_json::from_str(&input?)?;
             if let Err(_) = stdin_tx.send(Event::Message(input)) {
-                return Ok::<_, anyhow::Error>(());
+                return Ok::<_, GanError>(());
             }
         }
         let _ = stdin_tx.send(Event::EOF);
         Ok(())
     });
-    for input in rx {
-        node.step(input, &mut stdout)
-            .context("Node step function failed")?;
+    loop {
+        let Ok(input) = rx.recv() else {
+            break;
+        };
+        node.step(input, &mut stdout, &rx)?;
     }
-
-    handle
-        .join()
-        .expect("stdin thread panicked")
-        .context("stdin return error")?;
+    let _ = handle.join().expect("stdin thread panicked");
     Ok(())
 }
 
@@ -73,7 +65,7 @@ pub trait Node<S, Payload, InjectedPayload = ()> {
         init_state: S,
         init: Init,
         injecter: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
-    ) -> anyhow::Result<Self>
+    ) -> Result<Self>
     where
         Self: Sized;
 
@@ -81,7 +73,36 @@ pub trait Node<S, Payload, InjectedPayload = ()> {
         &mut self,
         input: Event<Payload, InjectedPayload>,
         output: &mut StdoutLock,
-    ) -> anyhow::Result<()>;
+        rx: &Receiver<Event<Payload, InjectedPayload>>,
+    ) -> Result<()>;
+}
+
+pub struct Runtime<'s, 'stdout, Payload> {
+    pub id: &'s mut usize,
+    pub node_id: &'s str,
+    pub rx: &'s Receiver<Event<Payload>>,
+    pub writer: &'s mut StdoutLock<'stdout>,
+    pub in_reply_to: Option<usize>,
+}
+
+pub trait KV {
+    type Value;
+    type Payload;
+    fn read(&self, rt: &mut Runtime<'_, '_, Self::Payload>, key: &str) -> Result<Self::Value>;
+    fn write(
+        &self,
+        rt: &mut Runtime<'_, '_, Self::Payload>,
+        key: String,
+        value: Self::Value,
+    ) -> Result<()>;
+    fn compare_exchange(
+        &self,
+        rt: &mut Runtime<'_, '_, Self::Payload>,
+        key: &str,
+        old: Self::Value,
+        new: Self::Value,
+        create_if_not_exists: bool,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,12 +130,36 @@ impl<Payload> Message<Payload> {
         }
     }
 
-    pub fn send(&self, output: &mut impl Write) -> anyhow::Result<()>
+    pub fn kv_message(
+        node_id: &str,
+        typ: &str,
+        id: Option<&mut usize>,
+        in_reply_to: Option<usize>,
+    ) -> Self
+    where
+        Payload: Default,
+    {
+        Message {
+            src: node_id.to_string(),
+            dst: typ.to_string(),
+            body: Body {
+                id: id.map(|id| {
+                    let mid = *id;
+                    *id += 1;
+                    mid
+                }),
+                in_reply_to,
+                payload: Default::default(),
+            },
+        }
+    }
+
+    pub fn send(&self, output: &mut impl Write) -> Result<()>
     where
         Self: Serialize,
     {
         serde_json::to_writer(&mut *output, self)?;
-        output.write_all(b"\n").context("write trailing newline")?;
+        output.write_all(b"\n")?;
         Ok(())
     }
 }
@@ -145,4 +190,28 @@ pub struct Init {
 enum InitPayload {
     Init(Init),
     InitOk,
+}
+
+#[derive(Error, Debug)]
+pub enum GanError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    SendError(String),
+    #[error(transparent)]
+    RecvError(#[from] std::sync::mpsc::RecvError),
+    #[error("receive rpc error with code({code}), text: {text}")]
+    Rpc { code: u8, text: String },
+    #[error("{0}")]
+    Normal(String),
+    #[error("cas precondition failed")]
+    PreconditionFailed,
+}
+
+impl<T> From<std::sync::mpsc::SendError<T>> for GanError {
+    fn from(value: std::sync::mpsc::SendError<T>) -> Self {
+        Self::SendError(format!("{}", value))
+    }
 }

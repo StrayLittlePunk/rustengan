@@ -1,11 +1,11 @@
 use std::io::StdoutLock;
+use std::sync::mpsc::Receiver;
 
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use rustengan::*;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     main_loop::<_, EchoNode, _, _>(())?;
     Ok(())
 }
@@ -14,13 +14,18 @@ struct EchoNode {
     id: usize,
 }
 impl Node<(), Payload> for EchoNode {
-    fn from_init(_: (), _: Init, _: std::sync::mpsc::Sender<Event<Payload>>) -> anyhow::Result<Self>
+    fn from_init(_: (), _: Init, _: std::sync::mpsc::Sender<Event<Payload>>) -> Result<Self>
     where
         Self: Sized,
     {
         Ok(EchoNode { id: 1 })
     }
-    fn step(&mut self, input: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn step(
+        &mut self,
+        input: Event<Payload>,
+        output: &mut StdoutLock,
+        _: &Receiver<Event<Payload>>,
+    ) -> Result<()> {
         let Event::Message(input) = input else {
             panic!("got injected event when there's no event injection");
         };
@@ -28,7 +33,7 @@ impl Node<(), Payload> for EchoNode {
         match reply.body.payload {
             Payload::Echo { echo } => {
                 reply.body.payload = Payload::EchoOk { echo };
-                reply.send(output).context("serialze repsonse to echo")?;
+                reply.send(output)?;
             }
             Payload::EchoOk { .. } => {}
         }

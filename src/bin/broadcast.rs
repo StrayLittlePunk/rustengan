@@ -1,15 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::io::StdoutLock;
-use std::sync::{Arc, Condvar, Mutex};
+use std::io::{StdoutLock, Write};
+use std::sync::{mpsc::Receiver, Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use anyhow::Context;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use rustengan::*;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     main_loop::<_, BroadcastNode, _, _>(())?;
     Ok(())
 }
@@ -29,7 +28,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         _: (),
         init: Init,
         tx: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
-    ) -> anyhow::Result<Self>
+    ) -> Result<Self>
     where
         Self: Sized,
     {
@@ -74,7 +73,8 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
         &mut self,
         input: Event<Payload, InjectedPayload>,
         output: &mut StdoutLock,
-    ) -> anyhow::Result<()> {
+        _: &Receiver<Event<Payload, InjectedPayload>>,
+    ) -> Result<()> {
         match input {
             Event::Message(input) => {
                 let mut reply = input.into_reply(Some(&mut self.id));
@@ -82,15 +82,13 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                     Payload::Broadcast { message } => {
                         self.messages.insert(message);
                         reply.body.payload = Payload::BroadcastOk;
-                        reply
-                            .send(output)
-                            .context("serialze repsonse to broadcast")?;
+                        reply.send(output)?;
                     }
                     Payload::Read => {
                         reply.body.payload = Payload::ReadOk {
                             messages: self.messages.iter().map(Clone::clone).collect(),
                         };
-                        reply.send(output).context("serialze repsonse to read")?;
+                        reply.send(output)?;
                     }
                     Payload::Topology { mut topology } => {
                         let topology_length = topology.len();
@@ -114,9 +112,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         self.neighborhood.shrink_to(topology_length / 2);
 
                         //eprintln!("neighborhood: {:?}", self.neighborhood);
-                        reply
-                            .send(output)
-                            .context("serialze repsonse to topology")?;
+                        reply.send(output)?;
                     }
                     Payload::Gossip { seen } => {
                         // eprintln!("gossip {}", reply.dst);
@@ -147,7 +143,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
 }
 
 impl BroadcastNode {
-    fn gossip(&mut self, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn gossip(&mut self, output: &mut impl Write) -> Result<()> {
         for n in &self.neighborhood {
             let knows_to_n = &self.known[n];
             let (already_known, mut notify_of): (HashSet<_>, HashSet<_>) = self
@@ -177,8 +173,7 @@ impl BroadcastNode {
                     payload: Payload::Gossip { seen: notify_of },
                 },
             }
-            .send(&mut *output)
-            .with_context(|| format!("gossip to {n}"))?;
+            .send(&mut *output)?;
         }
         Ok(())
     }
