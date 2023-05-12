@@ -19,6 +19,9 @@ broadcast-part: compile
 grow-counter: compile
 	./maelstrom/maelstrom test -w g-counter --bin ./target/debug/counter --node-count 3 --rate 100 --time-limit 20 --nemesis partition
 
+single-kafka: compile
+	./maelstrom/maelstrom test -w kafka --bin ./target/debug/single-kafka --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
+
 web:
 	./maelstrom/maelstrom serve
 
