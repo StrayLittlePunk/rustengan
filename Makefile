@@ -22,6 +22,9 @@ grow-counter: compile
 single-kafka: compile
 	./maelstrom/maelstrom test -w kafka --bin ./target/debug/single-kafka --node-count 1 --concurrency 2n --time-limit 20 --rate 1000
 
+multi-kafka: compile
+	./maelstrom/maelstrom test -w kafka --bin ./target/debug/multi-kafka --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
+
 web:
 	./maelstrom/maelstrom serve
 

@@ -18,7 +18,7 @@ struct SeqKv {}
 impl KV for SeqKv {
     type Value = u64;
     type Payload = Payload;
-    fn read(&self, rt: &mut Runtime<'_, '_, Self::Payload>, key: &str) -> Result<Self::Value> {
+    fn read(&mut self, rt: &mut Runtime<'_, '_, Self::Payload>, key: &str) -> Result<Self::Value> {
         let payload = Payload::KvRead {
             key: key.to_string(),
         };
@@ -41,7 +41,7 @@ impl KV for SeqKv {
     }
 
     fn write(
-        &self,
+        &mut self,
         rt: &mut Runtime<'_, '_, Self::Payload>,
         key: String,
         value: Self::Value,
@@ -62,7 +62,7 @@ impl KV for SeqKv {
     }
 
     fn compare_exchange(
-        &self,
+        &mut self,
         rt: &mut Runtime<'_, '_, Self::Payload>,
         key: &str,
         from: Self::Value,

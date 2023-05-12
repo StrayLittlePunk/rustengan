@@ -88,15 +88,15 @@ pub struct Runtime<'s, 'stdout, Payload> {
 pub trait KV {
     type Value;
     type Payload;
-    fn read(&self, rt: &mut Runtime<'_, '_, Self::Payload>, key: &str) -> Result<Self::Value>;
+    fn read(&mut self, rt: &mut Runtime<'_, '_, Self::Payload>, key: &str) -> Result<Self::Value>;
     fn write(
-        &self,
+        &mut self,
         rt: &mut Runtime<'_, '_, Self::Payload>,
         key: String,
         value: Self::Value,
     ) -> Result<()>;
     fn compare_exchange(
-        &self,
+        &mut self,
         rt: &mut Runtime<'_, '_, Self::Payload>,
         key: &str,
         old: Self::Value,
@@ -208,6 +208,8 @@ pub enum GanError {
     Normal(String),
     #[error("cas precondition failed")]
     PreconditionFailed,
+    #[error("key not exist")]
+    KeyNotExist,
 }
 
 impl<T> From<std::sync::mpsc::SendError<T>> for GanError {
