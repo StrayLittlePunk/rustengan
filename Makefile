@@ -28,6 +28,14 @@ multi-kafka: compile
 single-txn: compile
 	./maelstrom/maelstrom test -w txn-rw-register --bin ./target/debug/single-txn --node-count 1 --time-limit 20 --rate 1000 --concurrency 2n --consistency-models read-uncommitted --availability total
 
+uncommitted-txn: compile
+	./maelstrom/maelstrom test -w txn-rw-register --bin ./target/debug/txn --node-count 2 --concurrency 2n --time-limit 20 --rate 1000 --consistency-models read-uncommitted
+	@echo "transactions are totally-available in the face of network partitions"
+	./maelstrom/maelstrom test -w txn-rw-register --bin ./target/debug/txn --node-count 2 --concurrency 2n --time-limit 20 --rate 1000 --consistency-models read-uncommitted --availability total --nemesis partition
+	
+committed-txn: compile
+	./maelstrom/maelstrom test -w txn-rw-register --bin ./target/debug/txn --node-count 2 --concurrency 2n --time-limit 20 --rate 1000 --consistency-models read-committed --availability total --nemesis partition
+
 web:
 	./maelstrom/maelstrom serve
 
