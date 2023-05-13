@@ -42,6 +42,7 @@ where
     let handle = std::thread::spawn(move || {
         let stdin = std::io::stdin().lock();
         for input in stdin.lines() {
+            //eprintln!("read line {}", input.as_ref().unwrap());
             let input: Message<P> = serde_json::from_str(&input?)?;
             if let Err(_) = stdin_tx.send(Event::Message(input)) {
                 return Ok::<_, GanError>(());
@@ -86,7 +87,7 @@ pub struct Runtime<'s, 'stdout, Payload> {
 }
 
 pub trait KV {
-    type Value;
+    type Value: Default;
     type Payload;
     fn read(&mut self, rt: &mut Runtime<'_, '_, Self::Payload>, key: &str) -> Result<Self::Value>;
     fn write(
@@ -114,6 +115,24 @@ pub struct Message<Payload> {
 }
 
 impl<Payload> Message<Payload> {
+    pub fn reply(&self, id: Option<&mut usize>) -> Self
+    where
+        Payload: Default,
+    {
+        Self {
+            src: self.dst.clone(),
+            dst: self.src.clone(),
+            body: Body {
+                id: id.map(|id| {
+                    let mid = *id;
+                    *id += 1;
+                    mid
+                }),
+                in_reply_to: self.body.id,
+                payload: Default::default(),
+            },
+        }
+    }
     pub fn into_reply(self, id: Option<&mut usize>) -> Self {
         Self {
             src: self.dst,
@@ -158,6 +177,7 @@ impl<Payload> Message<Payload> {
     where
         Self: Serialize,
     {
+        //eprintln!("write out: {}", serde_json::to_string(self).unwrap());
         serde_json::to_writer(&mut *output, self)?;
         output.write_all(b"\n")?;
         Ok(())

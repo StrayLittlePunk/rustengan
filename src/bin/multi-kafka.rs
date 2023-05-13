@@ -15,8 +15,77 @@ fn main() -> Result<()> {
 struct KafkaNode {
     id: usize,
     node_id: String,
+    node_ids: Vec<String>,
     storage: LinKv,
     tx: Sender<Event<Payload>>,
+}
+
+impl KafkaNode {
+    fn send_proxy_node(
+        &mut self,
+        payload: Payload,
+        idx: usize,
+        output: &mut StdoutLock,
+        rx: &Receiver<Event<Payload>>,
+    ) -> Result<Payload> {
+        let dest = self.node_ids.get(idx).unwrap();
+        let mut message =
+            Message::kv_message(self.node_id.as_str(), dest, Some(&mut self.id), None);
+        message.body.payload = payload;
+        message.send(output)?;
+        loop {
+            let rt = Runtime {
+                id: &mut self.id,
+                node_id: &self.node_id,
+                rx,
+                writer: output,
+                in_reply_to: None,
+            };
+            let Event::Message(input) = rt.rx.recv()? else {
+                panic!("got injected event when there's no event injection");
+            };
+            let mut reply = input.reply(Some(rt.id));
+            let storage = &mut self.storage;
+            match input.body.payload {
+                Payload::SendOk { offset } => {
+                    return Ok(Payload::SendOk { offset });
+                }
+                //   Forward
+                // A --------> B
+                // A waiting
+                //    Forward
+                // B ---------> A
+                // B waiting
+                // A, B在等待过程中需要处理属于自己Forward Send 事件，然后返回结果，否则陷入死锁
+                Payload::ForwardSend { key, msg } => {
+                    let offset = storage.send(rt, key, msg)?;
+                    let payload = Payload::SendOk { offset };
+                    reply.body.payload = payload;
+                    reply.send(output)?;
+                    // 检查storage是否收到SendOk包，收到立刻发送这里loop接收，然后返回我们等到的offset。
+                    while let Some(index) = storage
+                        .stash_event
+                        .iter()
+                        .position(|c| matches!(&c.body.payload, &Payload::SendOk { .. }))
+                    {
+                        self.tx
+                            .send(Event::Message(storage.stash_event.remove(index)))?;
+                    }
+                }
+                Payload::Send { .. }
+                | Payload::Poll { .. }
+                | Payload::CommitOffsets { .. }
+                | Payload::ListCommittedOffsets { .. } => {
+                    storage.stash_event.push(input);
+                }
+                _ => {
+                    return Err(GanError::Normal(
+                        "should not exist invalid response".to_string(),
+                    ))
+                }
+            }
+        }
+    }
 }
 
 impl Node<(), Payload> for KafkaNode {
@@ -27,6 +96,7 @@ impl Node<(), Payload> for KafkaNode {
         Ok(KafkaNode {
             id: 1,
             node_id: init.node_id,
+            node_ids: init.node_ids,
             storage: LinKv {
                 stash_event: Vec::new(),
             },
@@ -51,10 +121,34 @@ impl Node<(), Payload> for KafkaNode {
             writer: output,
             in_reply_to: None,
         };
-        let storage = &mut self.storage;
         match reply.body.payload {
+            // receive a forward message
+            Payload::ForwardSend { key, msg } => {
+                let offset = self.storage.send(rt, key, msg)?;
+                reply.body.payload = Payload::SendOk { offset };
+            }
             Payload::Send { key, msg } => {
-                let offset = storage.send(rt, key, msg)?;
+                if let Some((k, nid)) = key
+                    .parse::<u64>()
+                    .ok()
+                    .zip((&self.node_id[1..]).parse::<u64>().ok())
+                {
+                    let idx = k % self.node_ids.len() as u64;
+                    if idx != nid {
+                        reply.body.payload = self.send_proxy_node(
+                            Payload::ForwardSend { key, msg },
+                            idx as usize,
+                            output,
+                            rx,
+                        )?;
+                        reply.send(output)?;
+                        for event in self.storage.stash_event.drain(..) {
+                            self.tx.send(Event::Message(event))?;
+                        }
+                        return Ok(());
+                    }
+                }
+                let offset = self.storage.send(rt, key, msg)?;
                 reply.body.payload = Payload::SendOk { offset };
             }
             Payload::Poll { offsets } => {
@@ -66,7 +160,7 @@ impl Node<(), Payload> for KafkaNode {
                 reply.body.payload = Payload::CommitOffsetsOk;
             }
             Payload::ListCommittedOffsets { keys } => {
-                let committed_offsets = storage.list_committed_offsets(rt, keys);
+                let committed_offsets = self.storage.list_committed_offsets(rt, keys);
                 reply.body.payload = Payload::ListCommittedOffsetsOk {
                     offsets: committed_offsets,
                 };
@@ -106,30 +200,69 @@ const KV_NAME: &str = "lin-kv";
 const PREFIX_COMMIT: &str = "commit";
 const PREFIX_LATEST: &str = "latest";
 const PREFIX_ENTRY: &str = "entry";
+const BATCH_SIZE: u64 = 20;
+
+trait EntriesExt {
+    fn append(&mut self, offset: u64, value: u64);
+    fn new_key(key: &str, offset: u64) -> Self;
+}
+
+impl EntriesExt for String {
+    fn append(&mut self, offset: u64, value: u64) {
+        if !self.is_empty() {
+            self.push(',');
+        }
+        self.push_str(format!("{offset}:{value}").as_str());
+    }
+
+    fn new_key(key: &str, offset: u64) -> Self {
+        let start = offset - offset % BATCH_SIZE;
+        format!("{}_{}_{}-{}", PREFIX_ENTRY, key, start, start + BATCH_SIZE)
+    }
+}
 
 impl LinKv {
     fn send(&mut self, mut rt: Runtime<Payload>, key: String, value: u64) -> Result<u64> {
         let latest_key = format!("{}_{}", PREFIX_LATEST, key);
-        let mut offset = match self.read(&mut rt, &latest_key) {
-            Ok(e) => e,
-            Err(GanError::KeyNotExist) => 0,
-            Err(e) => return Err(e),
-        };
-        let offset = loop {
-            match self.compare_exchange(&mut rt, latest_key.as_str(), offset, offset + 1, true) {
-                Ok(_) => break offset,
-                Err(GanError::PreconditionFailed) => {
-                    offset += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        self.write(
-            &mut rt,
-            format!("{}_{}_{}", PREFIX_ENTRY, key, offset),
-            value,
-        )?;
+        let offset = self
+            .read(&mut rt, &latest_key)?
+            .parse::<u64>()
+            .map(|x| x + 1)
+            .unwrap_or(0);
+        self.write(&mut rt, latest_key, offset.to_string())?;
+        // write batch entry
+        let entry_key = String::new_key(key.as_str(), offset);
+        let mut entries = self.read(&mut rt, &entry_key)?;
+        entries.append(offset, value);
+        self.write(&mut rt, entry_key, entries)?;
         Ok(offset)
+    }
+
+    fn read_segment(
+        &mut self,
+        rt: &mut Runtime<Payload>,
+        ofs: u64,
+        key: &str,
+        key_offsets: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        let mut start = ofs - ofs % BATCH_SIZE;
+        loop {
+            let entry_key = String::new_key(&key, start);
+            let entries = self.read(rt, &entry_key)?;
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries.split(',') {
+                let Some((o, v)) = entry.split_once(':').and_then(|(o, v)| o.parse().ok().zip(v.parse().ok())) else {
+                    continue;
+                };
+                if o >= ofs {
+                    key_offsets.push((o, v));
+                }
+            }
+            start += BATCH_SIZE;
+        }
+        Ok(())
     }
 
     fn poll(
@@ -143,13 +276,7 @@ impl LinKv {
         }
         for (key, ofs) in offsets.into_iter() {
             let mut key_offsets = Vec::new();
-            for o in ofs.. {
-                let value_key = format!("{}_{}_{}", PREFIX_ENTRY, key, o);
-                let Ok(value) = self.read(&mut rt, &value_key) else {
-                    break;
-                };
-                key_offsets.push((o, value));
-            }
+            self.read_segment(&mut rt, ofs, &key, &mut key_offsets)?;
             if !key_offsets.is_empty() {
                 result.insert(key, key_offsets);
             }
@@ -166,7 +293,8 @@ impl LinKv {
             return Ok(());
         }
         for (key, ofs) in offsets.into_iter() {
-            self.write(&mut rt, format!("{}_{}", PREFIX_COMMIT, key), ofs)?;
+            let commit_key = format!("{}_{}", PREFIX_COMMIT, key);
+            self.write(&mut rt, commit_key, ofs.to_string())?;
         }
         Ok(())
     }
@@ -183,7 +311,8 @@ impl LinKv {
             .filter_map(|k| {
                 let offset = self
                     .read(&mut rt, format!("{}_{}", PREFIX_COMMIT, k).as_str())
-                    .ok();
+                    .ok()
+                    .and_then(|c| c.parse().ok());
                 Some(k).zip(offset)
             })
             .collect()
@@ -191,7 +320,7 @@ impl LinKv {
 }
 
 impl KV for LinKv {
-    type Value = u64;
+    type Value = String;
     type Payload = Payload;
     fn read(&mut self, rt: &mut Runtime<'_, '_, Self::Payload>, key: &str) -> Result<Self::Value> {
         let payload = Payload::KvRead {
@@ -213,16 +342,19 @@ impl KV for LinKv {
                 }
                 Payload::Error { code, .. } if code == 20 => {
                     rt.in_reply_to = input.body.id;
-                    return Err(GanError::KeyNotExist);
+                    return Ok(Default::default());
                 }
                 Payload::Error { code, text } => {
                     rt.in_reply_to = input.body.id;
                     return Err(GanError::Rpc { code, text });
                 }
+
                 Payload::Send { .. }
                 | Payload::Poll { .. }
+                | Payload::SendOk { .. }
                 | Payload::CommitOffsets { .. }
-                | Payload::ListCommittedOffsets { .. } => {
+                | Payload::ListCommittedOffsets { .. }
+                | Payload::ForwardSend { .. } => {
                     self.stash_event.push(input);
                 }
                 _ => {
@@ -264,8 +396,10 @@ impl KV for LinKv {
                 }
                 Payload::Send { .. }
                 | Payload::Poll { .. }
+                | Payload::SendOk { .. }
                 | Payload::CommitOffsets { .. }
-                | Payload::ListCommittedOffsets { .. } => {
+                | Payload::ListCommittedOffsets { .. }
+                | Payload::ForwardSend { .. } => {
                     self.stash_event.push(input);
                 }
                 _ => {
@@ -319,9 +453,11 @@ impl KV for LinKv {
                     return Err(GanError::Rpc { code, text });
                 }
                 Payload::Send { .. }
+                | Payload::SendOk { .. }
                 | Payload::Poll { .. }
                 | Payload::CommitOffsets { .. }
-                | Payload::ListCommittedOffsets { .. } => {
+                | Payload::ListCommittedOffsets { .. }
+                | Payload::ForwardSend { .. } => {
                     self.stash_event.push(input);
                 }
                 _ => {
@@ -337,10 +473,14 @@ impl KV for LinKv {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Payload {
     Send {
+        key: String,
+        msg: u64,
+    },
+    ForwardSend {
         key: String,
         msg: u64,
     },
@@ -373,17 +513,17 @@ enum Payload {
         key: String,
     },
     ReadOk {
-        value: u64,
+        value: String,
     },
     Write {
         key: String,
-        value: u64,
+        value: String,
     },
     WriteOk,
     Cas {
         key: String,
-        from: u64,
-        to: u64,
+        from: String,
+        to: String,
         create_if_not_exists: bool,
     },
     CasOk,
