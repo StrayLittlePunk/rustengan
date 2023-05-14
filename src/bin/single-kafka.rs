@@ -213,9 +213,7 @@ where
                 idx += length as usize;
                 continue;
             }
-            for _ in 0..length {
-                data_block.remove(idx);
-            }
+            let _ = data_block.drain(idx..idx + length as usize);
             return Ok(());
         }
 
